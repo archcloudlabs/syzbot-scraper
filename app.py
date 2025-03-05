@@ -65,21 +65,36 @@ def download_assets(url):
         logging.info(f"Download {link}")
         name = link.split("tag=")[-1].split("&")[0]
         resp = requests.get(link)
-        print(f"[+] Downloading {name}")
+        if resp.text is None:
+            print("[!] could not download assets")
+            break
+
         if resp.text:
+            print(f"[+] Downloading {name}")
             if ".raw" or ".tar.gz" in name:
-                with open(f"./output/{dir_name}/{name.split('/')[-1]}", "wb+") as fout:
-                    fout.write(resp.content)
-            else:
-                with open(f"./output/{dir_name}/{name}", "wb+") as fout:
-                    fout.write(bytes(resp.text, encoding="utf-8"))
+                try:
+                    with open(f"./output/{dir_name}/{name.split('/')[-1]}", "wb+") as fout:
+                        fout.write(resp.content)
+                except IOError as io:
+                    print(f"[!] error, could not create file {dir_name}/{name}")
+                    break
+            else: # not .raw or .tar.gz file....
+                try:
+                    with open(f"./output/{dir_name}/{name}", "wb+") as fout:
+                        fout.write(bytes(resp.text, encoding="utf-8"))
+                except IOError as io:
+                    print(f"[!] error, could not create file {dir_name}/{name}")
+                    break
         else:
             logging.critical(f"could not download {link}")
-
             pass
 
 if __name__ == '__main__':
     raw_html = get_syzbot_upstream()
+    if raw_html is None:
+        print(f"[!] could not fetch syzbot upstream url {UPSTREAM}")
+        sys.exiit(1)
+
     soup = BeautifulSoup(raw_html.text, 'html.parser')
     rows = []
     links = []
