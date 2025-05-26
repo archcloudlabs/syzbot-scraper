@@ -7,7 +7,12 @@ import argparse
 import logging
 import sys
 import os
+import json
+from datetime import datetime
 from typing import List, Optional, Tuple
+import time
+from functools import wraps
+from pathlib import Path
 
 try:
     import requests
@@ -21,6 +26,47 @@ UPSTREAM = 'https://syzkaller.appspot.com/upstream'
 LTS_5_15 = 'https://syzkaller.appspot.com/linux-5.15'
 LTS_6_1  = 'https://syzkaller.appspot.com/linux-6.1'
 
+def setup_logging(log_level: str = "INFO") -> None:
+    """Configure structured logging"""
+    class CustomJsonFormatter(logging.Formatter):
+        def format(self, record):
+            record_dict = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "module": record.module,
+                "function": record.funcName,
+            }
+            if hasattr(record, "extra_data"):
+                record_dict.update(record.extra_data)
+            return json.dumps(record_dict)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(CustomJsonFormatter())
+    logging.root.handlers = []
+    logging.root.addHandler(handler)
+    logging.root.setLevel(getattr(logging, log_level.upper()))
+
+def rate_limit(min_interval: float = 1.0):
+    """Rate limiting decorator"""
+    last_called = {}
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            key = func.__name__
+            if key in last_called:
+                elapsed = now - last_called[key]
+                if elapsed < min_interval:
+                    time.sleep(min_interval - elapsed)
+            result = func(*args, **kwargs)
+            last_called[key] = time.time()
+            return result
+        return wrapper
+    return decorator
+
+@rate_limit(min_interval=2.0)  # Wait at least 2 seconds between requests
 def fetch_url(url: str, timeout: int = 10) -> Optional[requests.Response]:
     """
     Fetch content from a URL with error handling
@@ -77,10 +123,11 @@ def save_asset(output_dir: str, name: str, content: bytes, is_binary: bool = Fal
         mode = "wb+" if is_binary else "w+"
         filepath = os.path.join(output_dir, name.split('/')[-1])
         with open(filepath, mode) as fout:
+            logging.info(f"writing {name} to {output_dir}")
             if is_binary:
                 fout.write(content)
             else:
-                fout.write(content.decode('utf-8'))
+                fout.write(content.decode('utf-8', errors="ignore"))
         return True
     except IOError as io:
         logging.error(f"Error creating file {filepath}: {io}")
@@ -148,42 +195,50 @@ def main():
     """
     Main execution function
     """
-
-    args = argparse.ArgumentParser()
-    args.add_argument("--release", type=str, default="upstream", choices=["upstream", "lts-5.15", "lts-6.1"])
-    args.add_argument("--output", type=str, default="output")
-
-    parser = args.parse_args()
-
-    if parser.release == "upstream":
-        release_url = UPSTREAM
-    elif parser.release == "lts-5.15":
-        release_url = LTS_5_15
-    elif parser.release == "lts-6.1":
-        release_url = LTS_6_1
-    else:
-        logging.critical(f"Invalid release: {release_url}")
-        sys.exit(1)
-
-    raw_html = fetch_url(release_url)
-    if raw_html is None:
-        logging.critical(f"Could not fetch syzbot upstream url {parser.release}")
-        sys.exit(1)
-    soup = BeautifulSoup(raw_html.text, 'html.parser')
     
+    try:
+        args = argparse.ArgumentParser()
+        args.add_argument("--release", type=str, default="upstream", choices=["upstream", "lts-5.15", "lts-6.1"])
+        args.add_argument("--output", type=str, default="output")
+        args.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+        
+        parser = args.parse_args()
+        
+        setup_logging(parser.log_level)
+        logging.info("Starting syzbot scraper", extra={"release": parser.release, "output_dir": parser.output})
+        
+        if parser.release == "upstream":
+            release_url = UPSTREAM
+        elif parser.release == "lts-5.15":
+            release_url = LTS_5_15
+        elif parser.release == "lts-6.1":
+            release_url = LTS_6_1
+        else:
+            logging.critical(f"Invalid release: {parser.release}")
+            sys.exit(1)
 
-    # Download assets from main page
-    if not download_assets(release_url):
-        logging.warning("Failed to download some assets from main page")
+        raw_html = fetch_url(release_url)
+        if raw_html is None:
+            msg = f"Could not fetch syzbot url {parser.release}"
+            logging.critical(msg)
+            sys.exit(1)
 
-    # Extract and process bug links
-    _, bug_links = extract_bug_links(soup)
-    
-    # Download assets from each bug page
-    for url in bug_links:
-        if not download_assets(url):
-            logging.warning(f"Failed to download some assets from {url}")
+        soup = BeautifulSoup(raw_html.text, 'html.parser')
+        
+        if not download_assets(release_url):
+            logging.critical(f"Could not download: {release_url}. Quitting")
+            sys.exit(1)
+
+        # Extract and process bug links
+        _, bug_links = extract_bug_links(soup)
+        
+        for url in bug_links:
+            if not download_assets(url):
+                logging.warning(f"Failed to download some assets from {url}")
+        
+    except Exception as e:
+        logging.exception(f"Unexpected error occurred: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
     main()
