@@ -7,6 +7,7 @@ import argparse
 import logging
 import sys
 import os
+from typing import List, Optional, Tuple
 
 try:
     import requests
@@ -17,90 +18,120 @@ except ImportError as ie:
 
 BASE_URL = 'https://syzkaller.appspot.com'
 UPSTREAM = 'https://syzkaller.appspot.com/upstream'
-UPSTREAM = "https://syzkaller.appspot.com/bug?extid=9f6d080dece587cfdd4c"
+LTS_5_15 = 'https://syzkaller.appspot.com/linux-5.15'
+LTS_6_1  = 'https://syzkaller.appspot.com/linux-6.1'
 
-def get_syzbot_upstream():
+def fetch_url(url: str, timeout: int = 10) -> Optional[requests.Response]:
     """
-    Obtain syzbot entries on main page.
-    return: string data to be parsed
+    Fetch content from a URL with error handling
     """
     try:
-        resp = requests.get(UPSTREAM, timeout=10)
-    except requests.exceptions.ConnectTimeout as timeout:
-        logging.CRITICAL(f"timeout issue connecting to {UPSTREAM}")
-        sys.exit(1)
+        return requests.get(url, timeout=timeout)
+    except requests.exceptions.ConnectTimeout:
+        logging.critical(f"timeout issue connecting to {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.critical(f"Error fetching {url}: {e}")
+        return None
 
-    return resp
+def sanitize_directory_name(title: str) -> str:
+    """
+    Convert a title into a safe directory name
+    """
+    return title.replace(" ","_")\
+               .replace("-","_")\
+               .replace("/","_")\
+               .replace(":","_")
 
-def download_assets(url):
+def create_output_directory(dir_name: str) -> str:
+    """
+    Create output directory and return its path
+    """
+    output_path = f'./output/{dir_name}'
+    os.makedirs(output_path, exist_ok=True)
+    return output_path
 
-    resp = requests.get(url, timeout=10)
-    html_content = resp.text
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    if soup.title is None:
-        return
-
-    dir_name = soup.title.text\
-        .replace(" ","_")\
-        .replace("-","_")\
-        .replace("/","_")\
-        .replace(":","_")
-
-    os.makedirs(f'./output/{dir_name}', exist_ok=True)
-
-    # Find all asset links inside <td class="assets">
+def extract_asset_links(soup: BeautifulSoup) -> List[str]:
+    """
+    Extract all asset links from the page
+    """
     asset_links = []
+    
+    # Find asset links in assets class
     for td in soup.find_all("td", class_="assets"):
         links = td.find_all("a", href=True)
-        for link in links:
-            asset_links.append(link["href"])
-
+        asset_links.extend(link["href"] for link in links)
+    
+    # Find repro links
     for td in soup.find_all("td", class_="repro"):
         links = td.find_all("a", href=True)
-        for link in links:
-            asset_links.append(BASE_URL + link["href"])
+        asset_links.extend(BASE_URL + link["href"] for link in links)
+    
+    return asset_links
+
+def save_asset(output_dir: str, name: str, content: bytes, is_binary: bool = False) -> bool:
+    """
+    Save an asset to disk
+    """
+    try:
+        mode = "wb+" if is_binary else "w+"
+        filepath = os.path.join(output_dir, name.split('/')[-1])
+        with open(filepath, mode) as fout:
+            if is_binary:
+                fout.write(content)
+            else:
+                fout.write(content.decode('utf-8'))
+        return True
+    except IOError as io:
+        logging.error(f"Error creating file {filepath}: {io}")
+        return False
+
+def download_single_asset(url: str, output_dir: str) -> bool:
+    """
+    Download a single asset and save it
+    """
+    logging.info(f"Downloading {url}")
+    name = url.split("tag=")[-1].split("&")[0]
+    
+    resp = fetch_url(url)
+    if resp is None or resp.content is None:
+        logging.error(f"Could not download asset from {url}")
+        return False
+
+    is_binary = ".raw" in name or ".tar.gz" in name
+    return save_asset(output_dir, name, resp.content, is_binary)
+
+def download_assets(url: str) -> bool:
+    """
+    Download all assets from a given URL
+    """
+    resp = fetch_url(url)
+    if resp is None:
+        return False
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    if soup.title is None:
+        return False
+
+
+    release_dir = url.split("/")[-1]
+    dir_name = sanitize_directory_name(soup.title.text)
+    output_dir = create_output_directory(release_dir + "/" + dir_name)
+    asset_links = extract_asset_links(soup)
 
     for link in asset_links:
-        logging.info(f"Download {link}")
-        name = link.split("tag=")[-1].split("&")[0]
-        resp = requests.get(link)
-        if resp.text is None:
-            print("[!] could not download assets")
-            break
+        if not download_single_asset(link, output_dir):
+            return False
+            
+    return True
 
-        if resp.text:
-            print(f"[+] Downloading {name}")
-            if ".raw" or ".tar.gz" in name:
-                try:
-                    with open(f"./output/{dir_name}/{name.split('/')[-1]}", "wb+") as fout:
-                        fout.write(resp.content)
-                except IOError as io:
-                    print(f"[!] error, could not create file {dir_name}/{name}")
-                    break
-            else: # not .raw or .tar.gz file....
-                try:
-                    with open(f"./output/{dir_name}/{name}", "wb+") as fout:
-                        fout.write(bytes(resp.text, encoding="utf-8"))
-                except IOError as io:
-                    print(f"[!] error, could not create file {dir_name}/{name}")
-                    break
-        else:
-            logging.critical(f"could not download {link}")
-            pass
-
-if __name__ == '__main__':
-    raw_html = get_syzbot_upstream()
-    if raw_html is None:
-        print(f"[!] could not fetch syzbot upstream url {UPSTREAM}")
-        sys.exiit(1)
-
-    soup = BeautifulSoup(raw_html.text, 'html.parser')
+def extract_bug_links(soup: BeautifulSoup) -> Tuple[List[str], List[str]]:
+    """
+    Extract bug links and their associated data from the main table
+    """
     rows = []
     links = []
-
-    download_assets(UPSTREAM)
-
+    
     table = soup.find_all("tbody")[1]
     for row in table.find_all("tr")[1:]:  # Skip header row
         cells = row.find_all("td")
@@ -110,6 +141,49 @@ if __name__ == '__main__':
 
         rows.append(" ".join(row_data).replace('\n',' '))
         links.append(f"{BASE_URL}{link}")
+    
+    return rows, links
 
-    # links list now has bug links
-    [download_assets(_url) for _url in links]
+def main():
+    """
+    Main execution function
+    """
+
+    args = argparse.ArgumentParser()
+    args.add_argument("--release", type=str, default="upstream", choices=["upstream", "lts-5.15", "lts-6.1"])
+    args.add_argument("--output", type=str, default="output")
+
+    parser = args.parse_args()
+
+    if parser.release == "upstream":
+        release_url = UPSTREAM
+    elif parser.release == "lts-5.15":
+        release_url = LTS_5_15
+    elif parser.release == "lts-6.1":
+        release_url = LTS_6_1
+    else:
+        logging.critical(f"Invalid release: {release_url}")
+        sys.exit(1)
+
+    raw_html = fetch_url(release_url)
+    if raw_html is None:
+        logging.critical(f"Could not fetch syzbot upstream url {parser.release}")
+        sys.exit(1)
+    soup = BeautifulSoup(raw_html.text, 'html.parser')
+    
+
+    # Download assets from main page
+    if not download_assets(release_url):
+        logging.warning("Failed to download some assets from main page")
+
+    # Extract and process bug links
+    _, bug_links = extract_bug_links(soup)
+    
+    # Download assets from each bug page
+    for url in bug_links:
+        if not download_assets(url):
+            logging.warning(f"Failed to download some assets from {url}")
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    main()
