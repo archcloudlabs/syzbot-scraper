@@ -89,13 +89,20 @@ def sanitize_directory_name(title: str) -> str:
                .replace("/","_")\
                .replace(":","_")
 
-def create_output_directory(dir_name: str) -> str:
+def create_output_directory(dir_name: str, release: str) -> str:
     """
     Create output directory and return its path
+    Args:
+        dir_name: Name of the directory for the specific crash
+        release: Release type (upstream, lts-5.15, lts-6.1)
+    Returns:
+        Path to the created directory
     """
-    output_path = f'./output/{dir_name}'
-    os.makedirs(output_path, exist_ok=True)
-    return output_path
+    # Convert release name to directory format
+    release_dir = release.replace("-", "_")
+    output_path = Path('./output') / release_dir / dir_name
+    output_path.mkdir(parents=True, exist_ok=True)
+    return str(output_path)
 
 def extract_asset_links(soup: BeautifulSoup) -> List[str]:
     """
@@ -148,9 +155,13 @@ def download_single_asset(url: str, output_dir: str) -> bool:
     is_binary = ".raw" in name or ".tar.gz" in name
     return save_asset(output_dir, name, resp.content, is_binary)
 
-def download_assets(url: str) -> bool:
+def download_assets(url: str, release: str, is_main_page: bool = False) -> bool:
     """
     Download all assets from a given URL
+    Args:
+        url: The URL to download assets from
+        release: Release type (upstream, lts-5.15, lts-6.1)
+        is_main_page: Whether this is the main release page
     """
     resp = fetch_url(url)
     if resp is None:
@@ -160,17 +171,30 @@ def download_assets(url: str) -> bool:
     if soup.title is None:
         return False
 
-
-    release_dir = url.split("/")[-1]
-    dir_name = sanitize_directory_name(soup.title.text)
-    output_dir = create_output_directory(release_dir + "/" + dir_name)
+    if is_main_page:
+        dir_name = "main_page"
+    else:
+        dir_name = sanitize_directory_name(soup.title.text)
+    
+    output_dir = create_output_directory(dir_name, release)
     asset_links = extract_asset_links(soup)
-
+    
+    if not asset_links:
+        logging.warning(f"No assets found for {url}")
+        return True  # Not a failure if there are no assets
+        
+    success_count = 0
     for link in asset_links:
-        if not download_single_asset(link, output_dir):
-            return False
+        if download_single_asset(link, output_dir):
+            success_count += 1
+        else:
+            logging.warning(f"Failed to download asset {link}")
             
-    return True
+    if success_count == 0 and asset_links:
+        logging.error(f"Failed to download any assets from {url}")
+        return False
+            
+    return True  # Return true if we downloaded at least some assets
 
 def extract_bug_links(soup: BeautifulSoup) -> Tuple[List[str], List[str]]:
     """
@@ -225,16 +249,22 @@ def main():
 
         soup = BeautifulSoup(raw_html.text, 'html.parser')
         
-        if not download_assets(release_url):
+        if not download_assets(release_url, parser.release, is_main_page=True):
             logging.critical(f"Could not download: {release_url}. Quitting")
             sys.exit(1)
 
         # Extract and process bug links
         _, bug_links = extract_bug_links(soup)
         
+        failed_urls = []
         for url in bug_links:
-            if not download_assets(url):
-                logging.warning(f"Failed to download some assets from {url}")
+            logging.info(f"Processing bug URL: {url}")
+            if not download_assets(url, parser.release):
+                logging.error(f"Failed to download assets from {url}")
+                failed_urls.append(url)
+        
+        if failed_urls:
+            logging.warning(f"Failed to process {len(failed_urls)} URLs: {failed_urls}")
         
     except Exception as e:
         logging.exception(f"Unexpected error occurred: {e}")
